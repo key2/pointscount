@@ -67,6 +67,7 @@ cmake --build build --config Release
 | `--no-live-check` | Skip the is-live check |
 | `--cookies "k=v;.."` | Seed cookies (e.g. ttwid / sessionid) |
 | `--no-ws` | Use HTTP long-polling instead of the WebSocket |
+| `--debug [file]` | Dump 100% of the raw bytes received from TikTok to a file (default `tiktok_dump_<date>.log`) |
 
 Example — the stream currently shows 15 000 points and you want to keep
 counting from there:
@@ -78,6 +79,40 @@ counting from there:
 Press `Ctrl+C` to stop; the final total is printed on exit. Gifts received
 before the program connects are not counted (the connect backlog is skipped),
 so the baseline you pass with `--start` stays correct.
+
+## Debugging missed gifts
+
+If the total ever seems to miss a gift, run with `--debug`:
+
+```sh
+./build/pointscount @someuser --debug capture.log
+```
+
+The dump file records, one base64 record per line, **everything** TikTok
+sends, *before* any parsing or filtering (so nothing can be silently
+dropped):
+
+| kind | content |
+|---|---|
+| `ws_frame` | every raw WebSocket push frame, as received |
+| `im_fetch` | every raw `/webcast/im/fetch/` response body |
+| `msg:<Method>` | the payload of every decoded webcast message |
+| `# ...` | human-readable markers (connect, each gift commit, totals) |
+
+Analyze it later with `tools/decode_dump.py`:
+
+```sh
+tools/decode_dump.py capture.log            # record counts per message type
+tools/decode_dump.py capture.log --gifts    # decode every gift message
+tools/decode_dump.py capture.log --kind msg:WebcastGiftMessage --raw
+                                            # protoc --decode_raw each record
+tools/decode_dump.py capture.log --extract 541 frame.bin
+                                            # dump one record's bytes to a file
+```
+
+`--gifts` prints, for each `WebcastGiftMessage`: sender, gift id/name, gift
+type, repeat count, repeat_end, and diamond value — so you can compare what
+was on the wire against what the counter committed (the `#` marker lines).
 
 ---
 
@@ -139,6 +174,7 @@ cmake --build build --config Release
 | `--no-live-check` | 跳过开播状态检查 |
 | `--cookies "k=v;.."` | 预置 Cookie（例如 ttwid / sessionid） |
 | `--no-ws` | 用 HTTP 长轮询代替 WebSocket |
+| `--debug [文件]` | 把从 TikTok 收到的 100% 原始字节写入文件（默认 `tiktok_dump_<日期>.log`） |
 
 示例——直播间当前显示 15000 积分，从这个数继续计数：
 
@@ -148,6 +184,39 @@ cmake --build build --config Release
 
 按 `Ctrl+C` 停止，退出时会打印最终总分。程序连接之前收到的礼物不会被计入
 （连接时的历史消息会被跳过），因此 `--start` 传入的基准值保持准确。
+
+## 排查漏计的礼物
+
+如果发现总分似乎漏掉了某个礼物，加上 `--debug` 运行：
+
+```sh
+./build/pointscount @someuser --debug capture.log
+```
+
+转储文件以每行一条 base64 记录的形式，记录 TikTok 发来的**全部**数据，
+且在任何解析/过滤*之前*写入（因此不可能被悄悄丢弃）：
+
+| 类型 | 内容 |
+|---|---|
+| `ws_frame` | 收到的每个原始 WebSocket 推送帧 |
+| `im_fetch` | 每个 `/webcast/im/fetch/` 的原始响应体 |
+| `msg:<Method>` | 每条已解码 webcast 消息的负载 |
+| `# ...` | 人类可读的标记（连接、每次礼物入账、总分） |
+
+之后用 `tools/decode_dump.py` 分析：
+
+```sh
+tools/decode_dump.py capture.log            # 按消息类型统计记录数
+tools/decode_dump.py capture.log --gifts    # 解码所有礼物消息
+tools/decode_dump.py capture.log --kind msg:WebcastGiftMessage --raw
+                                            # 用 protoc --decode_raw 逐条解码
+tools/decode_dump.py capture.log --extract 541 frame.bin
+                                            # 把某条记录的字节导出到文件
+```
+
+`--gifts` 会打印每条 `WebcastGiftMessage` 的发送者、礼物 id/名称、礼物
+类型、连击数、repeat_end 和钻石价值——可以与计数器的入账记录
+（`#` 标记行）逐一对照，找出漏在哪里。
 
 ## License / 许可
 

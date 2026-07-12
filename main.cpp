@@ -11,13 +11,21 @@
 // the final message (repeat_end == 1) arrives. Non-streakable gifts are
 // committed immediately.
 //
-// Usage: pointscount <@username> [--start N] [options passed to ttlive]
+// Usage: pointscount <@username> [--start N] [--debug [file]] [options]
+//
+// --debug dumps 100% of the bytes received from TikTok (raw WebSocket push
+// frames, raw /im/fetch bodies, and every decoded webcast message payload)
+// to a file, one base64 record per line, so missed gifts can be analyzed
+// offline (see tools/decode_dump.py).
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -100,6 +108,69 @@ void print_total(const PointsCounter& counter) {
     std::cout << "\n" << std::flush;
 }
 
+// ---- Debug dump ------------------------------------------------------------
+
+std::string base64_encode(const uint8_t* data, size_t len) {
+    static const char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t v = static_cast<uint32_t>(data[i]) << 16;
+        if (i + 1 < len) v |= static_cast<uint32_t>(data[i + 1]) << 8;
+        if (i + 2 < len) v |= static_cast<uint32_t>(data[i + 2]);
+        out += tbl[(v >> 18) & 63];
+        out += tbl[(v >> 12) & 63];
+        out += (i + 1 < len) ? tbl[(v >> 6) & 63] : '=';
+        out += (i + 2 < len) ? tbl[v & 63] : '=';
+    }
+    return out;
+}
+
+// Line-oriented dump file. Records:
+//   <epoch_ms> <kind> <base64>     raw bytes from TikTok
+//   # <epoch_ms> <free text>       human-readable context markers
+class DebugDump {
+public:
+    bool open(const std::string& path) {
+        std::lock_guard<std::mutex> lk(mu_);
+        f_.open(path, std::ios::out | std::ios::app | std::ios::binary);
+        return f_.is_open();
+    }
+
+    void record(const std::string& kind, const uint8_t* data, size_t len) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!f_.is_open()) return;
+        f_ << now_ms() << ' ' << kind << ' ' << base64_encode(data, len) << '\n';
+        f_.flush();  // survive crashes / Ctrl+C
+    }
+
+    void note(const std::string& text) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!f_.is_open()) return;
+        f_ << "# " << now_ms() << ' ' << text << '\n';
+        f_.flush();
+    }
+
+private:
+    static int64_t now_ms() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    }
+
+    std::mutex mu_;
+    std::ofstream f_;
+};
+
+std::string default_dump_name() {
+    std::time_t t = std::time(nullptr);
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "tiktok_dump_%Y%m%d_%H%M%S.log",
+                  std::localtime(&t));
+    return buf;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -112,13 +183,18 @@ int main(int argc, char** argv) {
                      "  --no-live-check    Skip the is-live check\n"
                      "  --cookies \"k=v;..\" Seed cookies\n"
                      "  --no-ws            Use HTTP long-polling instead of WebSocket\n"
-                     "Example: %s @sandrahensley7197 --start 15000\n",
+                     "  --debug [file]     Dump 100%% of the raw bytes received from TikTok\n"
+                     "                     to a file (default tiktok_dump_<date>.log) for\n"
+                     "                     offline analysis with tools/decode_dump.py\n"
+                     "Example: %s @sandrahensley7197 --start 15000 --debug\n",
                      argv[0], argv[0]);
         return 2;
     }
 
     std::string username = argv[1];
     int64_t start_points = 0;
+    bool debug = false;
+    std::string debug_file;
     ttlive::ClientOptions opts;
     // The initial /im/fetch backlog can contain old gift messages from before
     // we started counting — skip them so the baseline stays correct.
@@ -136,10 +212,31 @@ int main(int argc, char** argv) {
             opts.cookies = argv[++i];
         } else if (a == "--no-ws") {
             opts.use_websocket = false;
+        } else if (a == "--debug") {
+            debug = true;
+            // Optional filename (next arg, unless it's another option).
+            if (i + 1 < argc && argv[i + 1][0] != '-') debug_file = argv[++i];
         }
     }
 
     PointsCounter counter(start_points);
+
+    DebugDump dump;
+    if (debug) {
+        if (debug_file.empty()) debug_file = default_dump_name();
+        if (!dump.open(debug_file)) {
+            std::fprintf(stderr, "Error: cannot open debug dump file '%s'\n",
+                         debug_file.c_str());
+            return 1;
+        }
+        std::cout << "[DEBUG] dumping all TikTok traffic to " << debug_file << "\n";
+        dump.note("pointscount debug dump start user=" + username +
+                  " start_points=" + std::to_string(start_points));
+        // Everything TikTok sends — raw WS frames and im/fetch bodies before
+        // any parsing, plus each decoded message — lands in the file.
+        opts.raw_sink = [&dump](const std::string& kind, const uint8_t* data,
+                                size_t len) { dump.record(kind, data, len); };
+    }
 
     ttlive::TikTokLiveClient client(username, opts);
     g_client = &client;
@@ -148,6 +245,7 @@ int main(int argc, char** argv) {
     client.on(ttlive::EventType::Connect, [&](const ttlive::Event& e) {
         std::cout << "[CONNECTED] @" << e.unique_id << " room_id=" << e.room_id
                   << "  starting from " << start_points << " points\n";
+        dump.note("connected room_id=" + std::to_string(e.room_id));
         print_total(counter);
     });
 
@@ -161,6 +259,12 @@ int main(int argc, char** argv) {
             std::cout << "[STREAK…] " << e.user.nickname << " sending '"
                       << e.gift_name << "' x" << e.repeat_count << " (worth "
                       << value << " so far, not counted yet)\n";
+            dump.note("gift STREAKING user=" + e.user.unique_id +
+                      " gift_id=" + std::to_string(e.gift_id) + " name='" +
+                      e.gift_name + "' x" + std::to_string(e.repeat_count) +
+                      " type=" + std::to_string(e.gift_type) +
+                      " diamonds=" + std::to_string(e.diamond_count) +
+                      " NOT_COUNTED total=" + std::to_string(counter.total()));
             print_total(counter);
             return;
         }
@@ -168,6 +272,13 @@ int main(int argc, char** argv) {
         counter.on_gift(e);
         std::cout << "[GIFT] " << e.user.nickname << " sent '" << e.gift_name
                   << "' x" << e.repeat_count << " = +" << value << " points\n";
+        dump.note("gift COMMIT user=" + e.user.unique_id +
+                  " gift_id=" + std::to_string(e.gift_id) + " name='" +
+                  e.gift_name + "' x" + std::to_string(e.repeat_count) +
+                  " type=" + std::to_string(e.gift_type) +
+                  " diamonds=" + std::to_string(e.diamond_count) + " +" +
+                  std::to_string(value) +
+                  " total=" + std::to_string(counter.total()));
         print_total(counter);
     });
 
@@ -178,6 +289,7 @@ int main(int argc, char** argv) {
 
     client.on(ttlive::EventType::Disconnect, [&](const ttlive::Event&) {
         std::cout << "[DISCONNECTED] final total: " << counter.total() << "\n";
+        dump.note("disconnected final_total=" + std::to_string(counter.total()));
     });
 
     try {
