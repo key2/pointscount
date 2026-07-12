@@ -1,0 +1,3 @@
+[submodule "ttlive-cpp"]
+	path = ttlive-cpp
+	url = https://github.com/key2/ttlive-cpp.git
