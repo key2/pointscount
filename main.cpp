@@ -41,37 +41,43 @@ void on_sigint(int) {
     if (g_client) g_client->disconnect();
 }
 
-struct PendingStreak {
-    std::string gift_name;
-    int32_t repeat_count = 0;
-    int64_t diamond_count = 0;
-};
-
+// Gift point accounting, streak-safe.
+//
+// Rules learned from real captures:
+//   * A streakable gift (gift_type == 1) is sent as a series of intermediate
+//     frames with repeat_end == 0 and a final frame with repeat_end == 1 that
+//     carries the FULL combo repeat_count. We count a streakable gift *only*
+//     on its final frame (repeat_end == 1) and IGNORE every repeat_end == 0
+//     frame. This is important because TikTok sometimes emits a trailing
+//     repeat_end == 0 frame *after* the final one (or reorders them); treating
+//     those as a new pending combo silently loses points. We keep no
+//     "pending" state that can leak into the total.
+//   * Non-streakable gifts (any other type) never send a final frame, so we
+//     count them as they arrive.
 class PointsCounter {
 public:
     explicit PointsCounter(int64_t start) : total_(start) {}
 
-    // Returns true if the event changed the committed total.
-    bool on_gift(const ttlive::Event& e) {
+    // Returns true if the event changed the committed total. `counted` tells
+    // the caller whether this gift's value was added (vs an ignored
+    // intermediate streak frame).
+    bool on_gift(const ttlive::Event& e, bool& counted) {
         std::lock_guard<std::mutex> lk(mu_);
         const bool streakable = (e.gift_type == 1);
         const int64_t value =
             static_cast<int64_t>(e.diamond_count) * std::max(e.repeat_count, 1);
 
+        // Intermediate frame of a streak: display-only, never counted.
         if (streakable && e.gift_streaking) {
-            // Intermediate combo update: remember it, do NOT count it.
-            PendingStreak& p = pending_[key(e)];
-            p.gift_name = e.gift_name;
-            p.repeat_count = e.repeat_count;
-            p.diamond_count = e.diamond_count;
+            in_progress_[key(e)] = value;  // for the live "streaking" figure
+            counted = false;
             return false;
         }
 
-        // Final message of a streak (repeat_end == 1) carries the full combo
-        // total in repeat_count — commit it once. Non-streakable gifts are
-        // committed as-is.
-        if (streakable) pending_.erase(key(e));
+        // Final frame of a streak (repeat_end == 1) or a non-streakable gift.
+        if (streakable) in_progress_.erase(key(e));
         total_ += value;
+        counted = true;
         return true;
     }
 
@@ -80,25 +86,23 @@ public:
         return total_;
     }
 
-    // Value of streaks still in progress (not yet committed).
+    // Value of streaks still in progress (display only; never in the total).
     int64_t pending() const {
         std::lock_guard<std::mutex> lk(mu_);
         int64_t sum = 0;
-        for (const auto& [k, p] : pending_)
-            sum += p.diamond_count * std::max(p.repeat_count, 1);
+        for (const auto& [k, v] : in_progress_) sum += v;
         return sum;
     }
 
 private:
-    // A combo is identified by (sender, gift). TikTok restarts repeat_count at
-    // 1 for a new combo, and the final frame closes the entry.
+    // A combo is identified by (sender, gift).
     static std::string key(const ttlive::Event& e) {
         return std::to_string(e.user.id) + ":" + std::to_string(e.gift_id);
     }
 
     mutable std::mutex mu_;
     int64_t total_ = 0;
-    std::map<std::string, PendingStreak> pending_;
+    std::map<std::string, int64_t> in_progress_;  // current combo value, display
 };
 
 void print_total(const PointsCounter& counter) {
@@ -243,19 +247,25 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, on_sigint);
 
     client.on(ttlive::EventType::Connect, [&](const ttlive::Event& e) {
+        // NOTE: the counter is created once and is intentionally NOT reset
+        // here. TikTok rooms reconnect (the room_id can even change mid-stream
+        // when the host restarts the LIVE); the running total must survive
+        // reconnects so points already counted are never thrown away.
         std::cout << "[CONNECTED] @" << e.unique_id << " room_id=" << e.room_id
-                  << "  starting from " << start_points << " points\n";
-        dump.note("connected room_id=" + std::to_string(e.room_id));
+                  << "  total so far " << counter.total() << " points\n";
+        dump.note("connected room_id=" + std::to_string(e.room_id) +
+                  " total=" + std::to_string(counter.total()));
         print_total(counter);
     });
 
     client.on(ttlive::EventType::Gift, [&](const ttlive::Event& e) {
-        const bool streakable = (e.gift_type == 1);
         const int64_t value =
             static_cast<int64_t>(e.diamond_count) * std::max(e.repeat_count, 1);
 
-        if (streakable && e.gift_streaking) {
-            counter.on_gift(e);
+        bool counted = false;
+        counter.on_gift(e, counted);
+
+        if (!counted) {
             std::cout << "[STREAK…] " << e.user.nickname << " sending '"
                       << e.gift_name << "' x" << e.repeat_count << " (worth "
                       << value << " so far, not counted yet)\n";
@@ -269,7 +279,6 @@ int main(int argc, char** argv) {
             return;
         }
 
-        counter.on_gift(e);
         std::cout << "[GIFT] " << e.user.nickname << " sent '" << e.gift_name
                   << "' x" << e.repeat_count << " = +" << value << " points\n";
         dump.note("gift COMMIT user=" + e.user.unique_id +
