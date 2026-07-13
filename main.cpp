@@ -186,7 +186,10 @@ int main(int argc, char** argv) {
                      "  --room-id <id>     Skip room scraping, connect directly\n"
                      "  --no-live-check    Skip the is-live check\n"
                      "  --cookies \"k=v;..\" Seed cookies\n"
-                     "  --no-ws            Use HTTP long-polling instead of WebSocket\n"
+                     "  --transport ws|poll  Real-time transport (default ws).\n"
+                     "                     ws   = WebSocket (low latency, auto-reconnect)\n"
+                     "                     poll = HTTP long-polling\n"
+                     "  --no-ws            Alias for --transport poll\n"
                      "  --debug [file]     Dump 100%% of the raw bytes received from TikTok\n"
                      "                     to a file (default tiktok_dump_<date>.log) for\n"
                      "                     offline analysis with tools/decode_dump.py\n"
@@ -216,6 +219,17 @@ int main(int argc, char** argv) {
             opts.cookies = argv[++i];
         } else if (a == "--no-ws") {
             opts.use_websocket = false;
+        } else if (a == "--transport" && i + 1 < argc) {
+            std::string t = argv[++i];
+            if (t == "ws" || t == "websocket") {
+                opts.use_websocket = true;
+            } else if (t == "poll" || t == "polling" || t == "http") {
+                opts.use_websocket = false;
+            } else {
+                std::fprintf(stderr, "Unknown --transport '%s' (use ws|poll)\n",
+                             t.c_str());
+                return 2;
+            }
         } else if (a == "--debug") {
             debug = true;
             // Optional filename (next arg, unless it's another option).

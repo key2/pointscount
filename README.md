@@ -66,8 +66,14 @@ cmake --build build --config Release
 | `--room-id <id>` | Skip room scraping, connect directly to a room id |
 | `--no-live-check` | Skip the is-live check |
 | `--cookies "k=v;.."` | Seed cookies (e.g. ttwid / sessionid) |
-| `--no-ws` | Use HTTP long-polling instead of the WebSocket |
+| `--transport ws\|poll` | Real-time transport (default `ws`). `ws` = WebSocket (low latency, auto-reconnect); `poll` = HTTP long-polling |
+| `--no-ws` | Alias for `--transport poll` |
 | `--debug [file]` | Dump 100% of the raw bytes received from TikTok to a file (default `tiktok_dump_<date>.log`) |
+
+The WebSocket transport now **reconnects automatically** if the socket drops
+mid-stream (brief backoff, cursor refreshed via REST, no double-counting), so
+a transient disconnect no longer stops the count. It falls back to HTTP polling
+only if the socket can never be established.
 
 Example — the stream currently shows 15 000 points and you want to keep
 counting from there:
@@ -173,8 +179,13 @@ cmake --build build --config Release
 | `--room-id <id>` | 跳过主页解析，直接用房间 id 连接 |
 | `--no-live-check` | 跳过开播状态检查 |
 | `--cookies "k=v;.."` | 预置 Cookie（例如 ttwid / sessionid） |
-| `--no-ws` | 用 HTTP 长轮询代替 WebSocket |
+| `--transport ws\|poll` | 实时传输方式（默认 `ws`）。`ws` = WebSocket（低延迟，自动重连）；`poll` = HTTP 长轮询 |
+| `--no-ws` | 等同于 `--transport poll` |
 | `--debug [文件]` | 把从 TikTok 收到的 100% 原始字节写入文件（默认 `tiktok_dump_<日期>.log`） |
+
+WebSocket 传输在连接中途断开时会**自动重连**（短暂退避、通过 REST 刷新
+cursor、不会重复计数），因此瞬时断连不再中断计数。仅当始终无法建立
+socket 时才回退到 HTTP 轮询。
 
 示例——直播间当前显示 15000 积分，从这个数继续计数：
 
