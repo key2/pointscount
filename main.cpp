@@ -29,7 +29,10 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <sstream>
 #include <string>
+#include <unordered_set>
+#include <vector>
 
 #include "ttlive/client.hpp"
 
@@ -58,32 +61,56 @@ class PointsCounter {
 public:
     explicit PointsCounter(int64_t start) : total_(start) {}
 
-    // Returns true if the event changed the committed total. `counted` tells
-    // the caller whether this gift's value was added (vs an ignored
-    // intermediate streak frame).
-    bool on_gift(const ttlive::Event& e, bool& counted) {
+    // Result of feeding a gift event to the counter.
+    enum class Result { Counted, Streaking, Duplicate };
+
+    // Feed a gift event. De-duplicates by server msg_id so the same gift
+    // delivered over both transports (or replayed on reconnect / reloaded from
+    // a ledger) is counted exactly once.
+    Result on_gift(const ttlive::Event& e, int64_t& value_out) {
         std::lock_guard<std::mutex> lk(mu_);
         const bool streakable = (e.gift_type == 1);
         const int64_t value =
             static_cast<int64_t>(e.diamond_count) * std::max(e.repeat_count, 1);
+        value_out = value;
 
         // Intermediate frame of a streak: display-only, never counted.
         if (streakable && e.gift_streaking) {
-            in_progress_[key(e)] = value;  // for the live "streaking" figure
-            counted = false;
-            return false;
+            in_progress_[combo_key(e)] = value;
+            return Result::Streaking;
         }
 
         // Final frame of a streak (repeat_end == 1) or a non-streakable gift.
-        if (streakable) in_progress_.erase(key(e));
+        // De-dup by msg_id: the counted frame is committed at most once.
+        if (e.msg_id != 0 && !counted_ids_.insert(e.msg_id).second)
+            return Result::Duplicate;
+
+        if (streakable) in_progress_.erase(combo_key(e));
         total_ += value;
-        counted = true;
-        return true;
+        return Result::Counted;
+    }
+
+    // Restore a previously-counted gift from a ledger line (no re-adding of
+    // value; sets state directly). Used by --reconnect.
+    void restore_counted(int64_t msg_id, int64_t total_after) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (msg_id != 0) counted_ids_.insert(msg_id);
+        total_ = total_after;  // ledger lines are in order; last one wins
+    }
+
+    void set_total(int64_t t) {
+        std::lock_guard<std::mutex> lk(mu_);
+        total_ = t;
     }
 
     int64_t total() const {
         std::lock_guard<std::mutex> lk(mu_);
         return total_;
+    }
+
+    size_t counted_count() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return counted_ids_.size();
     }
 
     // Value of streaks still in progress (display only; never in the total).
@@ -96,13 +123,14 @@ public:
 
 private:
     // A combo is identified by (sender, gift).
-    static std::string key(const ttlive::Event& e) {
+    static std::string combo_key(const ttlive::Event& e) {
         return std::to_string(e.user.id) + ":" + std::to_string(e.gift_id);
     }
 
     mutable std::mutex mu_;
     int64_t total_ = 0;
-    std::map<std::string, int64_t> in_progress_;  // current combo value, display
+    std::map<std::string, int64_t> in_progress_;   // current combo value, display
+    std::unordered_set<int64_t> counted_ids_;      // msg_ids already counted
 };
 
 void print_total(const PointsCounter& counter) {
@@ -175,6 +203,97 @@ std::string default_dump_name() {
     return buf;
 }
 
+// ---- Unified ledger --------------------------------------------------------
+//
+// A single append-only text file recording every *counted* gift (regardless of
+// which transport delivered it — the client de-duplicates by msg_id). Each
+// line is self-describing so the session state (running total + the set of
+// counted msg_ids) can be fully rebuilt on --reconnect.
+//
+//   # session  <ts> user=<u> mode=<connect|reconnect> start=<n>
+//   C <msg_id> <total_after> <value> <gift_id> <repeat> <diamonds> <user> <name>
+//   # end      <ts> total=<n>
+//
+// On a fresh connect the file is truncated; on --reconnect it is replayed to
+// restore state and then appended to.
+struct LedgerEntry {
+    int64_t msg_id = 0;
+    int64_t total_after = 0;
+};
+
+class Ledger {
+public:
+    // Replay an existing ledger: returns the counted (msg_id,total) entries in
+    // file order. Malformed / partially-written lines are skipped.
+    static std::vector<LedgerEntry> replay(const std::string& path) {
+        std::vector<LedgerEntry> out;
+        std::ifstream in(path);
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            std::istringstream ss(line);
+            char tag = 0;
+            ss >> tag;
+            if (tag != 'C') continue;
+            LedgerEntry e;
+            int64_t value, gid, rep, dia;
+            if (ss >> e.msg_id >> e.total_after >> value >> gid >> rep >> dia)
+                out.push_back(e);
+        }
+        return out;
+    }
+
+    // Open for appending (reconnect) or truncating (fresh connect).
+    bool open(const std::string& path, bool append) {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto mode = std::ios::out | (append ? std::ios::app : std::ios::trunc);
+        f_.open(path, mode);
+        return f_.is_open();
+    }
+
+    void header(const std::string& user, const std::string& mode, int64_t start) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!f_.is_open()) return;
+        f_ << "# session " << now_ms() << " user=" << user << " mode=" << mode
+           << " start=" << start << '\n';
+        f_.flush();
+    }
+
+    void count(const ttlive::Event& e, int64_t value, int64_t total_after) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!f_.is_open()) return;
+        // Sanitize name/handle (no spaces/newlines) so the line stays parseable.
+        f_ << "C " << e.msg_id << ' ' << total_after << ' ' << value << ' '
+           << e.gift_id << ' ' << e.repeat_count << ' ' << e.diamond_count << ' '
+           << sanitize(e.user.unique_id) << ' ' << sanitize(e.gift_name) << '\n';
+        f_.flush();  // durable against a kill
+    }
+
+    void end(int64_t total) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!f_.is_open()) return;
+        f_ << "# end " << now_ms() << " total=" << total << '\n';
+        f_.flush();
+    }
+
+    bool is_open() { std::lock_guard<std::mutex> lk(mu_); return f_.is_open(); }
+
+private:
+    static std::string sanitize(const std::string& s) {
+        std::string o;
+        o.reserve(s.size());
+        for (char c : s) o += (c == ' ' || c == '\n' || c == '\r') ? '_' : c;
+        return o.empty() ? "-" : o;
+    }
+    static int64_t now_ms() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    }
+    std::mutex mu_;
+    std::ofstream f_;
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -186,22 +305,31 @@ int main(int argc, char** argv) {
                      "  --room-id <id>     Skip room scraping, connect directly\n"
                      "  --no-live-check    Skip the is-live check\n"
                      "  --cookies \"k=v;..\" Seed cookies\n"
-                     "  --transport ws|poll  Real-time transport (default ws).\n"
-                     "                     ws   = WebSocket (low latency, auto-reconnect)\n"
-                     "                     poll = HTTP long-polling\n"
+                     "  --transport ws|poll|both  Real-time transport (default ws).\n"
+                     "                     ws   = WebSocket (fast, auto-reconnect)\n"
+                     "                     poll = HTTP long-polling (more complete)\n"
+                     "                     both = run both at once, de-duplicated by\n"
+                     "                            msg_id (accurate even if one drops)\n"
                      "  --no-ws            Alias for --transport poll\n"
+                     "  --log <file>       Unified ledger of counted gifts (msg_id +\n"
+                     "                     running total); required for --reconnect\n"
+                     "  --reconnect        Resume from --log: replay it to restore the\n"
+                     "                     total and counted msg_ids, then keep appending.\n"
+                     "                     Without it a fresh session truncates the log.\n"
                      "  --debug [file]     Dump 100%% of the raw bytes received from TikTok\n"
                      "                     to a file (default tiktok_dump_<date>.log) for\n"
                      "                     offline analysis with tools/decode_dump.py\n"
-                     "Example: %s @sandrahensley7197 --start 15000 --debug\n",
-                     argv[0], argv[0]);
+                     "Examples:\n"
+                     "  %s @_for.sera --start 15000 --transport both --log run.ledger\n"
+                     "  %s @_for.sera --transport both --log run.ledger --reconnect\n",
+                     argv[0], argv[0], argv[0]);
         return 2;
     }
 
     std::string username = argv[1];
     int64_t start_points = 0;
-    bool debug = false;
-    std::string debug_file;
+    bool debug = false, reconnect = false;
+    std::string debug_file, log_file;
     ttlive::ClientOptions opts;
     // The initial /im/fetch backlog can contain old gift messages from before
     // we started counting — skip them so the baseline stays correct.
@@ -219,17 +347,25 @@ int main(int argc, char** argv) {
             opts.cookies = argv[++i];
         } else if (a == "--no-ws") {
             opts.use_websocket = false;
+            opts.use_polling = true;
         } else if (a == "--transport" && i + 1 < argc) {
             std::string t = argv[++i];
             if (t == "ws" || t == "websocket") {
-                opts.use_websocket = true;
+                opts.use_websocket = true;  opts.use_polling = false;
             } else if (t == "poll" || t == "polling" || t == "http") {
-                opts.use_websocket = false;
+                opts.use_websocket = false; opts.use_polling = true;
+            } else if (t == "both" || t == "dual") {
+                opts.use_websocket = true;  opts.use_polling = true;
             } else {
-                std::fprintf(stderr, "Unknown --transport '%s' (use ws|poll)\n",
+                std::fprintf(stderr,
+                             "Unknown --transport '%s' (use ws|poll|both)\n",
                              t.c_str());
                 return 2;
             }
+        } else if (a == "--log" && i + 1 < argc) {
+            log_file = argv[++i];
+        } else if (a == "--reconnect") {
+            reconnect = true;
         } else if (a == "--debug") {
             debug = true;
             // Optional filename (next arg, unless it's another option).
@@ -237,7 +373,33 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (reconnect && log_file.empty()) {
+        std::fprintf(stderr, "Error: --reconnect requires --log <file>\n");
+        return 2;
+    }
+
     PointsCounter counter(start_points);
+
+    // Unified ledger: on --reconnect, replay it to restore the total and the
+    // set of counted msg_ids so nothing is double-counted across restarts; on a
+    // fresh connect, truncate it.
+    Ledger ledger;
+    if (!log_file.empty()) {
+        if (reconnect) {
+            auto entries = Ledger::replay(log_file);
+            for (const auto& en : entries) counter.restore_counted(en.msg_id, en.total_after);
+            std::cout << "[RECONNECT] restored " << entries.size()
+                      << " counted gifts from " << log_file
+                      << "; resuming at " << counter.total() << " points\n";
+        }
+        if (!ledger.open(log_file, /*append=*/reconnect)) {
+            std::fprintf(stderr, "Error: cannot open ledger '%s'\n",
+                         log_file.c_str());
+            return 1;
+        }
+        ledger.header(username, reconnect ? "reconnect" : "connect",
+                      reconnect ? counter.total() : start_points);
+    }
 
     DebugDump dump;
     if (debug) {
@@ -256,6 +418,11 @@ int main(int argc, char** argv) {
                                 size_t len) { dump.record(kind, data, len); };
     }
 
+    const char* transport = (opts.use_websocket && opts.use_polling) ? "both (ws+poll)"
+                            : opts.use_websocket ? "websocket" : "polling";
+    std::cout << "[TRANSPORT] " << transport
+              << (log_file.empty() ? "" : "  ledger=" + log_file) << "\n";
+
     ttlive::TikTokLiveClient client(username, opts);
     g_client = &client;
     std::signal(SIGINT, on_sigint);
@@ -273,13 +440,10 @@ int main(int argc, char** argv) {
     });
 
     client.on(ttlive::EventType::Gift, [&](const ttlive::Event& e) {
-        const int64_t value =
-            static_cast<int64_t>(e.diamond_count) * std::max(e.repeat_count, 1);
+        int64_t value = 0;
+        PointsCounter::Result r = counter.on_gift(e, value);
 
-        bool counted = false;
-        counter.on_gift(e, counted);
-
-        if (!counted) {
+        if (r == PointsCounter::Result::Streaking) {
             std::cout << "[STREAK…] " << e.user.nickname << " sending '"
                       << e.gift_name << "' x" << e.repeat_count << " (worth "
                       << value << " so far, not counted yet)\n";
@@ -292,16 +456,25 @@ int main(int argc, char** argv) {
             print_total(counter);
             return;
         }
+        if (r == PointsCounter::Result::Duplicate) {
+            // Already counted (other transport / replayed / reloaded). Silent.
+            dump.note("gift DUP msg_id=" + std::to_string(e.msg_id) +
+                      " user=" + e.user.unique_id + " +0 (already counted)");
+            return;
+        }
 
+        // Counted.
+        const int64_t total = counter.total();
+        if (ledger.is_open()) ledger.count(e, value, total);
         std::cout << "[GIFT] " << e.user.nickname << " sent '" << e.gift_name
                   << "' x" << e.repeat_count << " = +" << value << " points\n";
-        dump.note("gift COMMIT user=" + e.user.unique_id +
+        dump.note("gift COMMIT msg_id=" + std::to_string(e.msg_id) +
+                  " user=" + e.user.unique_id +
                   " gift_id=" + std::to_string(e.gift_id) + " name='" +
                   e.gift_name + "' x" + std::to_string(e.repeat_count) +
                   " type=" + std::to_string(e.gift_type) +
                   " diamonds=" + std::to_string(e.diamond_count) + " +" +
-                  std::to_string(value) +
-                  " total=" + std::to_string(counter.total()));
+                  std::to_string(value) + " total=" + std::to_string(total));
         print_total(counter);
     });
 
@@ -313,6 +486,7 @@ int main(int argc, char** argv) {
     client.on(ttlive::EventType::Disconnect, [&](const ttlive::Event&) {
         std::cout << "[DISCONNECTED] final total: " << counter.total() << "\n";
         dump.note("disconnected final_total=" + std::to_string(counter.total()));
+        if (ledger.is_open()) ledger.end(counter.total());
     });
 
     try {

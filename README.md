@@ -66,14 +66,45 @@ cmake --build build --config Release
 | `--room-id <id>` | Skip room scraping, connect directly to a room id |
 | `--no-live-check` | Skip the is-live check |
 | `--cookies "k=v;.."` | Seed cookies (e.g. ttwid / sessionid) |
-| `--transport ws\|poll` | Real-time transport (default `ws`). `ws` = WebSocket (low latency, auto-reconnect); `poll` = HTTP long-polling |
+| `--transport ws\|poll\|both` | Real-time transport (default `ws`). `ws` = WebSocket (fast, auto-reconnect); `poll` = HTTP long-polling (more complete); `both` = run both at once, de-duplicated |
 | `--no-ws` | Alias for `--transport poll` |
+| `--log <file>` | Unified ledger of counted gifts (msg_id + running total); required for `--reconnect` |
+| `--reconnect` | Resume from `--log`: replay it to restore the total and counted msg_ids, then keep appending (a fresh run truncates the log) |
 | `--debug [file]` | Dump 100% of the raw bytes received from TikTok to a file (default `tiktok_dump_<date>.log`) |
 
-The WebSocket transport now **reconnects automatically** if the socket drops
-mid-stream (brief backoff, cursor refreshed via REST, no double-counting), so
-a transient disconnect no longer stops the count. It falls back to HTTP polling
-only if the socket can never be established.
+### Transports & accuracy
+
+The WebSocket is fast but can miss a message or drop; polling is slower but
+more complete. `--transport both` runs them **concurrently** and de-duplicates
+every message by its server `msg_id`, so:
+
+- nothing is counted twice (the same gift over both transports is committed once);
+- if the socket drops, the poll loop keeps the count flowing (and the socket
+  auto-reconnects in the background);
+- the count stays accurate even when one transport alone would have gaps.
+
+The WebSocket also **reconnects automatically** on a drop (brief backoff,
+cursor refreshed via REST, no double-counting).
+
+### Resuming after a crash/kill (`--log` + `--reconnect`)
+
+Point a run at a ledger and it records every counted gift (with `msg_id` and the
+running total) to one file:
+
+```sh
+./build/pointscount @_for.sera --start 15000 --transport both --log run.ledger
+```
+
+If the app is killed, resume exactly where it left off — the ledger is replayed
+to restore the total and the set of already-counted `msg_id`s, so gifts are
+never recounted:
+
+```sh
+./build/pointscount @_for.sera --transport both --log run.ledger --reconnect
+```
+
+Without `--reconnect`, starting with an existing `--log` truncates it and begins
+a fresh session (from `--start`).
 
 Example — the stream currently shows 15 000 points and you want to keep
 counting from there:
@@ -179,13 +210,40 @@ cmake --build build --config Release
 | `--room-id <id>` | 跳过主页解析，直接用房间 id 连接 |
 | `--no-live-check` | 跳过开播状态检查 |
 | `--cookies "k=v;.."` | 预置 Cookie（例如 ttwid / sessionid） |
-| `--transport ws\|poll` | 实时传输方式（默认 `ws`）。`ws` = WebSocket（低延迟，自动重连）；`poll` = HTTP 长轮询 |
+| `--transport ws\|poll\|both` | 实时传输方式（默认 `ws`）。`ws` = WebSocket（快、自动重连）；`poll` = HTTP 长轮询（更完整）；`both` = 同时使用两者并去重 |
 | `--no-ws` | 等同于 `--transport poll` |
+| `--log <文件>` | 已计入礼物的统一账本（msg_id + 累计总分）；`--reconnect` 需要它 |
+| `--reconnect` | 从 `--log` 恢复：重放账本以还原总分和已计入的 msg_id，然后继续追加（不带该选项时新会话会清空账本） |
 | `--debug [文件]` | 把从 TikTok 收到的 100% 原始字节写入文件（默认 `tiktok_dump_<日期>.log`） |
 
-WebSocket 传输在连接中途断开时会**自动重连**（短暂退避、通过 REST 刷新
-cursor、不会重复计数），因此瞬时断连不再中断计数。仅当始终无法建立
-socket 时才回退到 HTTP 轮询。
+### 传输方式与准确性
+
+WebSocket 快但可能漏消息或断开；轮询较慢但更完整。`--transport both` 会
+**同时运行**两者，并按服务器 `msg_id` 对每条消息去重，因此：
+
+- 不会重复计数（同一礼物即使两个传输都收到也只计一次）；
+- socket 断开时轮询继续维持计数（后台自动重连 socket）；
+- 即使单一传输会有缺口，总数仍然准确。
+
+WebSocket 断开时也会**自动重连**（短暂退避、通过 REST 刷新 cursor、不重复计数）。
+
+### 崩溃/被杀后恢复（`--log` + `--reconnect`）
+
+用账本运行，程序会把每笔已计入礼物（含 `msg_id` 和累计总分）写入同一个文件：
+
+```sh
+./build/pointscount @_for.sera --start 15000 --transport both --log run.ledger
+```
+
+若程序被杀，可从中断处精确恢复——账本会被重放以还原总分和已计入的
+`msg_id` 集合，礼物不会被重复计算：
+
+```sh
+./build/pointscount @_for.sera --transport both --log run.ledger --reconnect
+```
+
+不带 `--reconnect` 时，若指定的 `--log` 已存在则会被清空并开始新会话
+（从 `--start` 起算）。
 
 示例——直播间当前显示 15000 积分，从这个数继续计数：
 
